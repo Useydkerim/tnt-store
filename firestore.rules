@@ -1,0 +1,79 @@
+rules_version = '2';
+
+// TNT Store — who may read and change what.
+// Every signed-in person must have an active users/{uid} profile; the first account ever created
+// becomes the admin. Stock can never go below zero, whoever writes it.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function uref(uid) { return /databases/$(database)/documents/users/$(uid); }
+    function setupRef() { return /databases/$(database)/documents/meta/setup; }
+    function me() { return get(uref(request.auth.uid)).data; }
+    function active() { return signedIn() && exists(uref(request.auth.uid)) && me().active == true; }
+    function admin() { return active() && me().role == 'admin'; }
+    function can(p) { return active() && (me().role == 'admin' || me().perms.get(p, false) == true); }
+    function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+    function stockOk() { return request.resource.data.qty is number && request.resource.data.qty >= 0; }
+
+    // Public: the login screen shows the shop name/logo and needs to know if setup is done.
+    match /settings/{id} {
+      allow read: if true;
+      allow write: if admin();
+    }
+    match /meta/setup {
+      allow read: if true;
+      allow create: if signedIn() && existsAfter(uref(request.auth.uid))
+                    && getAfter(uref(request.auth.uid)).data.role == 'admin';
+    }
+
+    match /users/{uid} {
+      allow read: if active() || (signedIn() && request.auth.uid == uid);
+      // First-run: the very first account makes itself admin, together with meta/setup.
+      allow create: if signedIn() && request.auth.uid == uid
+                    && !exists(setupRef()) && existsAfter(setupRef())
+                    && request.resource.data.role == 'admin' && request.resource.data.active == true;
+      allow create: if admin();
+      // Admin edits anyone; everyone may rename themselves.
+      allow update: if admin() || (active() && request.auth.uid == uid && changed().hasOnly(['name']));
+    }
+
+    match /counters/{id} { allow read, create, update: if active(); }
+    match /days/{id}     { allow read, create, update: if active(); }
+    match /moves/{id}    { allow read, create: if active(); }
+
+    match /products/{id} {
+      allow read: if active();
+      allow create: if can('stock') && stockOk();
+      allow update: if active() && stockOk() && (
+        // full edit (name, prices, stock adjustments…)
+        (can('stock') && !changed().hasAny(['deleted'])) ||
+        // hide a deleted product
+        (can('del') && changed().hasOnly(['deleted', 'updatedAt'])) ||
+        // any active user: stock/sold counters changed by a sale, return or order status
+        changed().hasOnly(['qty', 'sold', 'used', 'updatedAt'])
+      );
+      allow delete: if can('del');
+    }
+
+    match /sales/{id} {
+      allow read, create: if active();
+      // Online order statuses are managed by everyone; cancelling a store invoice needs "del".
+      allow update: if active() && (resource.data.type == 'online'
+                                    || request.resource.data.status == resource.data.status
+                                    || can('del'));
+    }
+    match /returns/{id}   { allow read: if active(); allow create: if can('returns'); }
+    match /customers/{id} { allow read, create, update: if active(); allow delete: if can('del'); }
+    match /suppliers/{id} { allow read: if active(); allow create, update: if can('stock'); allow delete: if can('del'); }
+    match /purchases/{id} {
+      allow read: if can('stock') || can('money');
+      allow create, update: if can('stock');
+      allow delete: if can('stock') && can('del');
+    }
+    match /supPays/{id}   { allow read: if can('stock') || can('money'); allow create: if can('stock'); }
+    match /expenses/{id} {
+      allow read, create, update: if can('money');
+      allow delete: if can('money') && can('del');
+    }
+  }
+}
